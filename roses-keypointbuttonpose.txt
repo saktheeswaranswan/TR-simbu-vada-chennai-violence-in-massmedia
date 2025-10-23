@@ -1,0 +1,580 @@
+// === Multi-person Pose + Video Overlay (Emoji 🌹 @ selected keypoint) ===
+// Shows ALL persons in the JSON. JSON inspector shows parsed OR raw.
+// "Rose:10" button toggles rose-on-all at keypoint 10. Use the stepper to change keypoint index.
+
+const FPS = 30;
+const POSE_W = 640, POSE_H = 480;
+const EDGES = [
+  [5,7],[7,9],[6,8],[8,10],
+  [11,13],[13,15],[12,14],[14,16],
+  [5,6],[11,12],[5,11],[6,12]
+];
+
+let app;
+
+function preload(){
+  app = new App('Hghdugfy.mp4', 'simbuu.json', 'head.png');
+  app.preload();
+}
+function setup(){ createCanvas(1280,720); frameRate(FPS); app.setup(); }
+function draw(){ app.tick(); }
+function mousePressed(){ app.onMousePressed(); }
+function mouseDragged(){ app.onMouseDragged(); }
+function mouseReleased(){ app.onMouseReleased(); }
+function keyPressed(){ app.onKey(key.toUpperCase()); }
+function mouseWheel(e){
+  if (app && app.showJSON) {
+    app.jsonScroll += e.deltaY > 0 ? 3 : -3;
+    app.jsonScroll = max(0, app.jsonScroll);
+    return false;
+  }
+  return true;
+}
+
+// === App (main) ===
+class App {
+  constructor(videoFile, poseJSONFile, headFile){
+    this.videoFile = videoFile;
+    this.poseJSONFile = poseJSONFile;
+    this.headFile = headFile;
+
+    this.video = null;
+    this.headImg = null;
+
+    // JSON + parsed frames (frame -> persons -> keypoints)
+    this.rawJSON = null;
+    this.poseMap = new Map();
+    this.jsonReady = false;
+    this.videoReady = false;
+    this.anyDrawReady = false;
+
+    // playback
+    this.t = 0;
+    this.playing = false;
+    this.rate = 1;
+
+    // view
+    this.scaleCycle = [1,0.75,0.5,0.25];
+    this.scaleIdx = 0;
+    this.scale = this.scaleCycle[this.scaleIdx];
+    this.pointSizes = [6,12,18,24,36];
+    this.ptIdx = 1;
+    this.ptSize = this.pointSizes[this.ptIdx];
+    this.headSize = 150;
+    this.alpha = 160;
+    this.offset = {x:0,y:0};
+    this.drag = {on:false,dx:0,dy:0};
+    this.showLabels = false;
+
+    // rose control
+    this.roseEmoji = '🌹';
+    this.roseScale = 5;
+    this.roseBasePx = 24;
+    this.roseYOffset = 0.5;
+    this.roseKeypoint = 10;      // default kp index to place rose
+    this.roseOnAll = false;      // when true, show rose for all persons at roseKeypoint
+
+    // trails
+    this.trails = {};
+    this.showTrails = true;
+    this.maxTrail = 240;
+    this.trailAlpha = 160;
+    this.trailWeight = 3;
+    this.trailColors = [[0,200,255],[255,80,0],[0,255,120],[255,200,0],[180,120,255],[255,0,180]];
+    this.trailSkip = 1;
+
+    // caches
+    this._vw=0; this._vh=0; this._scaleX=1; this._scaleY=1; this._lastPoseFrame = 0;
+
+    // UI
+    this.ui = new UI();
+    this.param = { speed:1.0, alpha:160, tlen:240, twidth:3, start:0.0, dur:2.0 };
+
+    // autoplay-safe init button
+    this.inited = false;
+    this.initBtn = new UIButton(width/2 - 100, height/2 - 32, 200, 'Start / Init', ()=>this._userInit());
+
+    // JSON inspector
+    this.showJSON = false;
+    this.jsonRawView = false;
+    this.jsonPanelW = 480;
+    this.jsonPanelPadding = 12;
+    this.jsonMaxRows = 24;
+    this.jsonScroll = 0;
+  }
+
+  preload(){
+    // load JSON (store raw + normalized map of frames)
+    loadJSON(this.poseJSONFile, (data) => {
+      this.rawJSON = data;
+      const entries = Array.isArray(data) ? data : Object.values(data);
+      for (let i = 0; i < entries.length; i++){
+        const e = entries[i];
+        const fid = Number(e.frame_id ?? e.frameId ?? e.frame);
+        if (!Number.isFinite(fid)) continue;
+        let persons = e.persons ?? e.keypoints ?? e.kpts;
+        if (!persons) continue;
+        // Normalize: persons[][][]; if flat kpts, wrap in array
+        if (!(Array.isArray(persons) && persons.length && Array.isArray(persons[0]) && Array.isArray(persons[0][0]))){
+          persons = [persons];
+        }
+        // Normalize each keypoint element to either null or array
+        const personsNorm = persons.map(k => k.map(p => p ? p : null));
+        this.poseMap.set(fid, personsNorm);
+        this._lastPoseFrame = max(this._lastPoseFrame, fid);
+      }
+      this.jsonReady = true;
+      this.anyDrawReady = true;
+      console.log('Loaded pose JSON. lastFrame=', this._lastPoseFrame);
+    }, (err)=>{
+      console.error('JSON load failed:', err);
+      this.rawJSON = null;
+      this.jsonReady = false;
+      this.anyDrawReady = false;
+    });
+
+    // optional head image
+    this.headImg = loadImage(this.headFile, ()=>{}, ()=>{ this.headImg = null; });
+  }
+
+  setup(){
+    // create video element (do not autoplay)
+    this.video = createVideo([this.videoFile], ()=>{
+      this.video.hide();
+      this.video.elt.muted = true;
+      this.video.elt.playsInline = true;
+      this.video.volume = 0;
+      this.video.speed(this.rate);
+      this.videoReady = true;
+      console.log('Video loaded (if available).');
+    }, (err)=>{
+      console.warn('Video load failed:', err);
+      this.videoReady = false;
+    });
+
+    this._buildUI();
+  }
+
+  _userInit(){
+    this.inited = true;
+    if (this.video && this.videoReady){
+      try { this.video.loop(); this.video.speed(this.rate); } catch(e){}
+      this.playing = true;
+    }
+  }
+
+  tick(){
+    background(12);
+
+    if (!this.anyDrawReady) {
+      this._drawStatus('Waiting for pose JSON…\nAdd "simbuu.json" to the project to view poses.');
+      this.initBtn.x = width/2 - 100; this.initBtn.y = height/2 - 32;
+      this.initBtn.draw();
+      this.ui.draw();
+      return;
+    }
+
+    // advance time only when playing and video available (otherwise dt not tied to video)
+    if (this.playing && this.video && this.videoReady) {
+      this.t += (deltaTime/1000) * this.rate;
+      const vd = this.video?.elt?.duration ?? Infinity;
+      if (this.t >= vd) { this.t = vd; this.pause(); }
+      else if (Math.abs(this.video.time() - this.t) > 0.1) this.video.time(this.t);
+    }
+
+    // fit video area (left side)
+    const aspect = POSE_W / POSE_H;
+    this._vh = height;
+    this._vw = this._vh * aspect;
+    this._scaleX = this._vw / POSE_W;
+    this._scaleY = this._vh / POSE_H;
+
+    // draw video or placeholder
+    if (this.video && this.videoReady && this.inited) {
+      image(this.video, 0, 0, this._vw, this._vh);
+    } else {
+      push();
+      noStroke(); fill(28);
+      rect(0,0,this._vw,this._vh);
+      fill(170); textAlign(CENTER, CENTER); textSize(16);
+      text(this.videoReady ? 'Click "Start / Init" to play video' : 'No video — running in no-video mode', this._vw/2, this._vh/2);
+      pop();
+    }
+
+    // draw trails then pose (works for multiple persons)
+    if (this.showTrails) this._drawTrails();
+    this._drawPose();
+
+    // JSON inspector (parsed or raw)
+    if (this.showJSON) this._drawJSONPanel();
+
+    // show init button if video available but not started
+    if (this.videoReady && !this.inited) {
+      this.initBtn.x = width/2 - 100; this.initBtn.y = height/2 - 32;
+      this.initBtn.draw();
+    }
+
+    // UI
+    this.ui.draw();
+  }
+
+  _drawStatus(msg){ push(); fill(255); textAlign(CENTER,CENTER); textSize(18); text(msg, width/2, height/2 - 60); pop(); }
+
+  _drawPose(){
+    const frameIndex = floor(this.t * FPS);
+    const persons = this.poseMap.get(frameIndex) || [];
+
+    push();
+    translate(this.offset.x, this.offset.y);
+    scale(this.scale);
+
+    // bones for every person
+    stroke(255,255,0,this.alpha);
+    strokeWeight(max(3, 4/this.scale));
+    noFill();
+    for (let p = 0; p < persons.length; p++){
+      const k = persons[p];
+      for (let e = 0; e < EDGES.length; e++){
+        const a = k[EDGES[e][0]], b = k[EDGES[e][1]];
+        if (!a || !b) continue;
+        line(a[0]*this._scaleX, a[1]*this._scaleY, b[0]*this._scaleX, b[1]*this._scaleY);
+      }
+    }
+
+    // joints, labels, head, rose (for every person)
+    noStroke(); fill(255,0,0,this.alpha); textAlign(CENTER, CENTER);
+    const roseSize = this.roseBasePx * this.roseScale;
+    const yOff = this.ptSize * this.roseYOffset;
+    const lblSize = max(10, 14 / this.scale);
+
+    for (let p = 0; p < persons.length; p++){
+      const k = persons[p];
+      // color each person slightly by index when drawing joints
+      const colorIdx = p % this.trailColors.length;
+      const personFill = this.trailColors[colorIdx];
+      fill(personFill[0], personFill[1], personFill[2], this.alpha);
+
+      for (let i = 0; i < k.length; i++){
+        const pt = k[i];
+        if (!pt) continue;
+        const x = pt[0] * this._scaleX, y = pt[1] * this._scaleY;
+
+        // joint point
+        ellipse(x, y, this.ptSize);
+
+        // label (optional)
+        if (this.showLabels){
+          fill(255,255,255, max(90, this.alpha - 30));
+          textSize(lblSize); text(i.toString(), x, y - this.ptSize);
+          fill(personFill[0], personFill[1], personFill[2], this.alpha);
+        }
+
+        // head image on keypoint 0
+        if (i === 0 && this.headImg){
+          push(); imageMode(CENTER); tint(255, this.alpha);
+          const hs = this.headSize * this.scale; image(this.headImg, x, y - hs/2, hs, hs); pop();
+        }
+      }
+
+      // rose for this person if enabled & keypoint exists
+      if (this.roseOnAll) {
+        const kp = k[this.roseKeypoint];
+        if (kp) {
+          const rx = kp[0] * this._scaleX, ry = kp[1] * this._scaleY;
+          push();
+          fill(255,255,255,this.alpha); textSize(roseSize); text(this.roseEmoji, rx, ry - yOff);
+          pop();
+        }
+      }
+    }
+
+    pop();
+
+    // update trails AFTER drawing
+    this._updateTrails(frameIndex, persons);
+  }
+
+  _updateTrails(frameIndex, persons){
+    if ((frameIndex % this.trailSkip) !== 0) return;
+    for (let pi = 0; pi < persons.length; pi++){
+      if (!this.trails[pi]) this.trails[pi] = {};
+      const kpts = persons[pi];
+      for (let ki = 0; ki < kpts.length; ki++){
+        const p = kpts[ki]; if (!p) continue;
+        const arr = (this.trails[pi][ki] ||= []);
+        arr.push({ x: p[0], y: p[1] });
+        if (arr.length > this.maxTrail) arr.shift();
+      }
+    }
+  }
+
+  _drawTrails(){
+    push(); translate(this.offset.x, this.offset.y); scale(this.scale);
+    const baseW = max(1.25, this.trailWeight / this.scale);
+    for (const piStr in this.trails){
+      const pi = Number(piStr);
+      const [r,g,b] = this.trailColors[pi % this.trailColors.length];
+      const parts = this.trails[pi];
+      for (const kiStr in parts){
+        const pts = parts[kiStr];
+        if (!pts || pts.length < 2) continue;
+        strokeWeight(baseW);
+        for (let s = 1; s < pts.length; s++){
+          const a = lerp(40, this.trailAlpha, s / pts.length);
+          stroke(r,g,b,a);
+          const p1 = pts[s-1], p2 = pts[s];
+          line(p1.x * this._scaleX, p1.y * this._scaleY, p2.x * this._scaleX, p2.y * this._scaleY);
+        }
+      }
+    }
+    pop();
+  }
+
+  // ---------- JSON inspector (shows all persons) ----------
+  _drawJSONPanel(){
+    const w = this.jsonPanelW;
+    const h = height - 32;
+    const x = width - w - 12;
+    const y = 16;
+    const pad = this.jsonPanelPadding;
+    const headerH = 32;
+    const lineH = 16;
+
+    push();
+    noStroke(); fill(14,16,20,230); rect(x,y,w,h,8);
+
+    fill(255); textAlign(LEFT, CENTER); textSize(14);
+    const frameIndex = floor(this.t * FPS);
+    const totalFrames = this._lastPoseFrame > 0 ? (this._lastPoseFrame + 1) : 'n/a';
+    const mode = this.jsonRawView ? 'RAW' : 'PARSED';
+    text(`JSON Inspector (${mode}) — frame ${frameIndex} / ${totalFrames}`, x + pad, y + headerH/2);
+
+    textSize(11); fill(200);
+    text('Toggle: J | RAW toggle: K | Scroll: wheel / [ ]', x + pad, y + headerH - 6);
+
+    if (!this.jsonReady) {
+      fill(180); textAlign(CENTER, CENTER); textSize(12);
+      text('Pose JSON not loaded', x + w/2, y + h/2); pop(); return;
+    }
+
+    // build rows
+    let rows = [];
+    if (this.jsonRawView) {
+      // RAW: show raw object for current frame if present, else whole JSON
+      const entries = Array.isArray(this.rawJSON) ? this.rawJSON : Object.values(this.rawJSON);
+      let found = null;
+      for (let i = 0; i < entries.length; i++){
+        const e = entries[i];
+        const fid = Number(e.frame_id ?? e.frameId ?? e.frame);
+        if (Number.isFinite(fid) && fid === frameIndex){ found = e; break; }
+      }
+      const toShow = found ?? this.rawJSON;
+      try {
+        rows = JSON.stringify(toShow, null, 2).split('\n');
+      } catch(e) {
+        rows = ['<failed to stringify raw JSON>'];
+      }
+    } else {
+      // PARSED: show each person and all keypoints (x,y[,score]) exactly
+      const persons = this.poseMap.get(frameIndex) || [];
+      rows.push(`frame: ${frameIndex}  persons: ${persons.length}`);
+      for (let pi = 0; pi < persons.length; pi++){
+        const kpts = persons[pi];
+        rows.push(` person[${pi}] keypoints: ${kpts.length}`);
+        for (let ki = 0; ki < kpts.length; ki++){
+          const p = kpts[ki];
+          if (!p) { rows.push(`   [${ki}]: null`); continue; }
+          // preserve numeric precision & any extra elements
+          const elems = p.map(v => (typeof v === 'number') ? (Number.isInteger(v) ? v.toString() : v.toFixed(3)) : JSON.stringify(v));
+          rows.push(`   [${ki}]: [ ${elems.join(', ')} ]`);
+        }
+      }
+    }
+
+    // clamp scroll & visible
+    const total = rows.length;
+    this.jsonScroll = constrain(this.jsonScroll, 0, Math.max(0, total - this.jsonMaxRows));
+    const start = this.jsonScroll;
+    const end = min(total, start + this.jsonMaxRows);
+
+    pop(); // reset transforms
+    push();
+    translate(x + pad, y + headerH + 6);
+    noStroke(); textAlign(LEFT, TOP); textSize(12);
+    let ty = 0;
+    for (let r = start; r < end; r++){
+      const s = rows[r];
+      // small color hints
+      if (!this.jsonRawView) {
+        if (s.startsWith('frame:')) fill(180,255,180);
+        else if (s.trim().startsWith('person[')) fill(180,220,255);
+        else fill(210);
+        text(s, 0, ty);
+      } else {
+        // raw view light syntax tint
+        if (/^\s*["\{\[]/.test(s)) fill(180,220,255);
+        else if (/^\s*[\}\]]/.test(s)) fill(200,200,200);
+        else fill(220);
+        text(s, 0, ty);
+      }
+      ty += lineH;
+    }
+
+    // scrollbar
+    pop();
+    push();
+    fill(40,80); noStroke();
+    const trackX = x + w - pad*1.5 - 8;
+    const trackY = y + headerH + 6;
+    const trackH = h - headerH - 12;
+    rect(trackX, trackY, 8, trackH, 4);
+    const thumbH = max(20, (this.jsonMaxRows / max(1, total)) * trackH);
+    const thumbYRange = trackH - thumbH;
+    const thumbY = (total <= this.jsonMaxRows) ? 0 : (this.jsonScroll / (total - this.jsonMaxRows)) * thumbYRange;
+    fill(200,160);
+    rect(trackX, trackY + thumbY, 8, thumbH, 4);
+    pop();
+  }
+
+  // transport
+  play(){ this.playing = true; if (this.video && this.videoReady) try { this.video.play(); this.video.speed(this.rate); } catch(e) {} }
+  pause(){ this.playing = false; if (this.video) try { this.video.pause(); } catch(e) {} }
+  stop(){ this.playing = false; this.t = 0; if (this.video) try { this.video.pause(); this.video.time(0); } catch(e) {} }
+
+  // input
+  onKey(k){
+    if (k === 'T') this.showTrails = !this.showTrails;
+    if (k === 'P') (this.playing ? this.pause() : this.play());
+    if (k === 'L') this.showLabels = !this.showLabels;
+    if (k === 'C') this.trails = {};
+    if (k === 'S') { this.param.start = +((this.t||0).toFixed(2)); this.ui.syncFrom(this); }
+    if (k === 'J') { this.showJSON = !this.showJSON; this.jsonScroll = 0; }
+    if (k === 'K') { this.jsonRawView = !this.jsonRawView; this.jsonScroll = 0; }
+    if (k === '[') { this.jsonScroll = max(0, this.jsonScroll - 3); }
+    if (k === ']') { this.jsonScroll += 3; }
+  }
+
+  onMousePressed(){
+    if (this.initBtn.contains(mouseX, mouseY)){ this.initBtn.mousePressed(); return; }
+    if (this.ui.mousePressed()) return;
+    this.drag.on = true; this.drag.dx = mouseX - this.offset.x; this.drag.dy = mouseY - this.offset.y;
+  }
+  onMouseDragged(){ if (!this.drag.on) return; this.offset.x = mouseX - this.drag.dx; this.offset.y = mouseY - this.drag.dy; }
+  onMouseReleased(){ if (this.initBtn.down) this.initBtn.mouseReleased(); if (this.ui.mouseReleased()) return; this.drag.on = false; }
+
+  // export helper
+  saveWindowJSON(startSec=0, durationSec=2){
+    if (!this.jsonReady) return;
+    startSec = max(0, Number(startSec) || 0);
+    durationSec = max(0, Number(durationSec) || 0);
+    const vd = (this.video && isFinite(this.video.elt.duration)) ? this.video.elt.duration : Infinity;
+    const startF = max(0, floor(startSec * FPS));
+    const endFExcl = min(floor((startSec + durationSec) * FPS), floor((isFinite(vd) ? vd : Infinity) * FPS) + 1);
+    const hardEnd = min(endFExcl, this._lastPoseFrame + 1);
+
+    const out = [];
+    for (let f = startF; f < hardEnd; f++){
+      const rel = f - startF;
+      const persons = this.poseMap.get(f) || [];
+      const personsCopy = persons.map(kpts => kpts.map(p => (p ? [p[0], p[1], p[2] ?? 1] : null)));
+      out.push({ frame_id: rel, time_sec: +(rel / FPS).toFixed(3), persons: personsCopy });
+    }
+    const s0 = (0).toFixed(2), s1 = durationSec.toFixed(2);
+    saveJSON(out, `pose_segment_rel_${s0}-${s1}s.json`);
+  }
+
+  // build UI (canvas-only)
+  _buildUI(){
+    const y = height - 110;
+    const row = (i) => y + i * 36;
+    const right = width - 12;
+
+    this.ui.add(new UIButton(12, row(0), 64, 'Play', ()=>this.play()));
+    this.ui.add(new UIButton(80, row(0), 64, 'Pause', ()=>this.pause()));
+    this.ui.add(new UIButton(148,row(0),64,'Stop', ()=>this.stop()));
+    this.ui.add(new UIButton(216,row(0),72,'Scale', ()=>{
+      this.scaleIdx = (this.scaleIdx + 1) % this.scaleCycle.length;
+      this.scale = this.scaleCycle[this.scaleIdx];
+      this.ptIdx = (this.ptIdx + 1) % this.pointSizes.length;
+      this.ptSize = this.pointSizes[this.ptIdx];
+    }));
+    this.ui.add(new UIButton(294,row(0),120,'Toggle Trails', ()=> this.showTrails = !this.showTrails));
+    this.ui.add(new UIButton(418,row(0),110,'Clear Trails', ()=> { this.trails = {}; }));
+    this.ui.add(new UIButton(532,row(0),100,'Labels (L)', ()=> this.showLabels = !this.showLabels));
+
+    // JSON toggle + raw
+    this.ui.add(new UIButton(right - 78, row(0), 66, 'JSON', ()=>{ this.showJSON = !this.showJSON; if(!this.showJSON) this.jsonScroll = 0; }));
+    this.ui.add(new UIButton(right - 140, row(0), 60, 'RAW', ()=>{ this.jsonRawView = !this.jsonRawView; this.jsonScroll = 0; }));
+
+    // Rose:10 toggle button (top row)
+    const roseBtn = new UIButton(right - 220, row(0), 110, `Rose:${this.roseKeypoint}`, ()=>{
+      this.roseOnAll = !this.roseOnAll;
+      // Update button label to reflect toggle state
+      roseBtn.label = `${this.roseOnAll ? 'RoseOnAll' : 'Rose:' + this.roseKeypoint}`;
+    });
+    // store for external updates (stepper changes)
+    this.roseToggleButton = roseBtn;
+    this.ui.add(roseBtn);
+
+    // row 1 sliders
+    this.ui.add(new UILabel(12,row(1),'Speed'));
+    this.ui.add(new UISlider(70,row(1),200,0.25,2.0,this.param.speed,0.01,(v)=>{ this.param.speed=v; this.rate=v; if(this.video) this.video.speed(v); }));
+    this.ui.add(new UILabel(280,row(1),'Alpha'));
+    this.ui.add(new UISlider(336,row(1),200,0,255,this.param.alpha,1,(v)=>{ this.param.alpha=v; this.alpha=v|0; }));
+    this.ui.add(new UILabel(548,row(1),'Trail Len'));
+    this.ui.add(new UISlider(620,row(1),220,10,600,this.param.tlen,1,(v)=>{ this.param.tlen=v|0; this.maxTrail=v|0; }));
+    this.ui.add(new UILabel(848,row(1),'Thick'));
+    this.ui.add(new UISlider(898,row(1),150,1,8,this.param.twidth,0.5,(v)=>{ this.param.twidth=v; this.trailWeight=v; }));
+
+    // row 2: stepper for rose keypoint + export
+    this.ui.add(new UILabel(12,row(2),'Rose KP'));
+    const kpStepper = new UIStepper(76,row(2),120,this.roseKeypoint,1,0,99,(v)=>{ 
+      this.roseKeypoint = Math.max(0, Math.round(v)); 
+      // update rose button label if not toggled on
+      if (!this.roseOnAll) this.roseToggleButton.label = 'Rose:' + this.roseKeypoint;
+      else this.roseToggleButton.label = 'RoseOnAll';
+    });
+    this.ui.add(kpStepper);
+
+    this.ui.add(new UIButton(206,row(2),110,'↘ Start=Now', ()=>{ this.param.start = +((this.t||0).toFixed(2)); this.ui.syncFrom(this); }));
+    this.ui.add(new UIButton(right-420,row(2),120,'Save 0–2s', ()=> this.saveWindowJSON(0,2)));
+    this.ui.add(new UIButton(right-294,row(2),120,'Save 0–5s', ()=> this.saveWindowJSON(0,5)));
+    this.ui.add(new UIButton(right-168,row(2),156,'Save Range', ()=> this.saveWindowJSON(this.param.start, this.param.dur)));
+  }
+}
+
+// === Canvas UI primitives ===
+class UI { constructor(){ this.items=[]; this._active=null; } add(w){ this.items.push(w); w.ui=this; return w; } draw(){ for(const w of this.items) w.draw(); } mousePressed(){ for(let i=this.items.length-1;i>=0;i--){ const w=this.items[i]; if(w.mousePressed && w.contains(mouseX,mouseY)){ this._active=w; w.mousePressed(); return true; } } return false; } mouseDragged(){ if(this._active && this._active.mouseDragged) this._active.mouseDragged(); } mouseReleased(){ if(this._active && this._active.mouseReleased) this._active.mouseReleased(); this._active=null; return true; } syncFrom(app){ for(const w of this.items) if(w.syncFrom) w.syncFrom(app); } }
+
+class UILabel { constructor(x,y,text){ this.x=x; this.y=y; this.text=text; this.h=24; } contains(){ return false; } draw(){ push(); noStroke(); fill(220); textSize(14); textAlign(LEFT,CENTER); text(this.text,this.x,this.y+12); pop(); } }
+
+class UIButton {
+  constructor(x,y,w,label,onClick){ this.x=x; this.y=y; this.w=w; this.h=28; this.label=label; this.onClick=onClick; this.down=false; }
+  contains(px,py){ return px>=this.x && px<=this.x+this.w && py>=this.y && py<=this.y+this.h; }
+  draw(){ const hover=this.contains(mouseX,mouseY); push(); noStroke(); fill(this.down?30:(hover?50:35)); rect(this.x,this.y,this.w,this.h,8); stroke(255,140); noFill(); rect(this.x,this.y,this.w,this.h,8); noStroke(); fill(255); textAlign(CENTER,CENTER); textSize(13); text(this.label,this.x+this.w/2,this.y+this.h/2); pop(); }
+  mousePressed(){ this.down=true; }
+  mouseReleased(){ if(this.down && this.contains(mouseX,mouseY) && this.onClick) this.onClick(); this.down=false; }
+}
+
+class UISlider {
+  constructor(x,y,w,min,max,value,step,onChange){ this.x=x; this.y=y; this.w=w; this.h=24; this.min=min; this.max=max; this.value=value; this.step=step||0.01; this.onChange=onChange; this.grab=false; }
+  contains(px,py){ return px>=this.x && px<=this.x+this.w && py>=this.y && py<=this.y+this.h; }
+  _valToX(v){ return this.x+(this.w-1)*((v-this.min)/(this.max-this.min)); }
+  _xToVal(px){ const t=constrain((px-this.x)/(this.w-1),0,1); const v=this.min+t*(this.max-this.min); return (this.step>0)? Math.round(v/this.step)*this.step : v; }
+  draw(){ push(); stroke(120); strokeWeight(2); line(this.x,this.y+this.h/2,this.x+this.w,this.y+this.h/2); const kx=this._valToX(this.value); noStroke(); fill(230); circle(kx,this.y+this.h/2,12); noStroke(); fill(220); textAlign(LEFT,CENTER); textSize(12); text(this.value.toFixed((this.step>=1)?0:(this.step>=0.1?1:2)), this.x+this.w+8, this.y+this.h/2); pop(); }
+  mousePressed(){ this.grab=true; this.value=this._xToVal(mouseX); if(this.onChange) this.onChange(this.value); }
+  mouseDragged(){ if(!this.grab) return; this.value=this._xToVal(mouseX); if(this.onChange) this.onChange(this.value); }
+  mouseReleased(){ this.grab=false; }
+  syncFrom(){}
+}
+
+class UIStepper {
+  constructor(x,y,w,value,step,min,max,onChange){ this.x=x; this.y=y; this.w=w; this.h=28; this.value=value; this.step=step||1; this.min=min??-Infinity; this.max=max??Infinity; this.onChange=onChange; this.btnW=28; this._dec=new UIButton(x,y,this.btnW,'–',()=>this._bump(-1)); this._inc=new UIButton(x+w-this.btnW,y,this.btnW,'+',()=>this._bump(+1)); }
+  _bump(dir){ let v=this.value+dir*this.step; v=constrain(v,this.min,this.max); this.value=v; if(this.onChange) this.onChange(this.value); }
+  contains(px,py){ return px>=this.x && px<=this.x+this.w && py>=this.y && py<=this.y+this.h; }
+  draw(){ push(); noFill(); stroke(180,140); rect(this.x,this.y,this.w,this.h,6); noStroke(); fill(240); textAlign(CENTER,CENTER); textSize(13); text(this.value.toFixed(0), this.x+this.w/2, this.y+this.h/2); pop(); this._dec.draw(); this._inc.draw(); }
+  mousePressed(){ if (this._dec.contains(mouseX,mouseY)) this._dec.mousePressed(); else if (this._inc.contains(mouseX,mouseY)) this._inc.mousePressed(); }
+  mouseDragged() {}
+  mouseReleased(){ if(this._dec.down) this._dec.mouseReleased(); if(this._inc.down) this._inc.mouseReleased(); }
+  syncFrom(app){ const s=(this.onChange&&this.onChange.toString())||''; if(s.includes('param.start')) this.value=app.param.start; if(s.includes('param.dur')) this.value=app.param.dur; }
+}
