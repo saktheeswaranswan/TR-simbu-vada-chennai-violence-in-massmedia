@@ -1,0 +1,597 @@
+// fast_pose_refactor_perf.js
+// Performance-optimized p5.js pose + video overlay sketch
+// Key perf moves:
+//  - parse JSON once and precompute centroid + valid edge lists per person/frame
+//  - optional downsampling and maxFrames limit when loading huge JSONs
+//  - minimal work in draw(): no repeated centroid calculations, no dynamic map resizing
+//  - labels and full-pose-on-canvas off by default to speed drawing
+
+const FPS = 30;
+const POSE_W = 640, POSE_H = 480;
+const EDGES = [
+  [5,7],[7,9],[6,8],[8,10],
+  [11,13],[13,15],[12,14],[14,16],
+  [5,6],[11,12],[5,11],[6,12]
+];
+
+// tune these to trade off speed vs fidelity
+const POSE_LOADER_OPTIONS = {
+  downsample: 1,    // keep only every Nth frame (1 = all)
+  maxFrames: Infinity, // stop parsing after this many frames (useful for enormous JSONs)
+  precomputeEdges: true // precompute which EDGES exist per person to speed draw
+};
+
+let app;
+
+function preload(){
+  app = new App({
+    videoFile: 'Hghdugfy.mp4',
+    poseJSONFile: 'simbuu.json',
+    headFile: 'head.png',
+    poseLoaderOpts: POSE_LOADER_OPTIONS
+  });
+  app.preload();
+}
+
+function setup(){ createCanvas(1280,720); frameRate(FPS); app.setup(); }
+function draw(){ background(12); app.tick(); }
+function mousePressed(){ app.onMousePressed(); }
+function mouseDragged(){ app.onMouseDragged(); }
+function mouseReleased(){ app.onMouseReleased(); }
+function keyPressed(){ app.onKey(key.toUpperCase()); }
+function mouseWheel(evt) { if (app && app.ui && app.ui.jsonOpen) { app.ui.scrollJSON(evt.deltaY>0?3:-3); return false; } return true; }
+
+// ------------------------- small utils -------------------------
+function avgPoint(points){ if(!points || !points.length) return null; let sx=0, sy=0, n=0; for(const p of points){ if(!p) continue; sx+=p[0]; sy+=p[1]; n++; } return n? [sx/n, sy/n] : null; }
+function dist2(a,b){ const dx=(a[0]-b[0]); const dy=(a[1]-b[1]); return dx*dx+dy*dy; }
+function clampStr(s, maxLen=120){ if(!s) return ''; if(s.length<=maxLen) return s; return s.slice(0,maxLen-3)+'...'; }
+function formatKptsArray(kpts, limit=6, showScore=false){
+  if(!kpts) return '[]';
+  const arr = [];
+  for(let i=0;i<Math.min(limit, kpts.length); i++){
+    const p = kpts[i];
+    if(!p) arr.push('null');
+    else {
+      const x = Math.round(p[0]);
+      const y = Math.round(p[1]);
+      if(showScore && p.length>=3) arr.push(`[${x},${y},${p[2].toFixed(2)}]`);
+      else arr.push(`[${x},${y}]`);
+    }
+  }
+  if(kpts.length>limit) arr.push('...');
+  return '['+arr.join(', ')+']';
+}
+
+// ------------------------- PoseLoader (optimized) -------------------------
+class PoseLoader {
+  constructor(jsonPath, opts = {}) {
+    this.jsonPath = jsonPath;
+    this.poseMap = new Map(); // key: frameIndex -> array of Person objects
+    this.lastFrame = 0;
+    this.ready = false;
+    this.opts = Object.assign({}, POSE_LOADER_OPTIONS, opts);
+  }
+
+  preload(done){
+    if(!this.jsonPath){ this.ready=false; done && done(); return; }
+    // loadJSON is async; do light-weight parsing afterwards
+    loadJSON(this.jsonPath, (data)=>{
+      try{
+        this._parseRaw(data);
+        this.ready = true;
+      }catch(e){
+        console.warn('Parsing pose JSON failed', e);
+        this.ready = false;
+      }
+      done && done();
+    }, (err)=>{ console.warn('Pose JSON load failed', err); this.ready=false; done && done(); });
+  }
+
+  _parseRaw(data){
+    // Clear previous
+    this.poseMap.clear();
+    this.lastFrame = 0;
+
+    // Accept array or object
+    const arrInput = Array.isArray(data) ? data : Object.values(data);
+    const down = Math.max(1, Math.floor(this.opts.downsample || 1));
+    const maxF = Math.max(0, Number(this.opts.maxFrames) || Infinity);
+    let loadedFrames = 0;
+
+    // iterate once, normalize and precompute data for fast drawing
+    for(let i=0;i<arrInput.length;i++){
+      if(loadedFrames >= maxF) break;
+      const e = arrInput[i];
+      const fidRaw = Number(e.frame_id ?? e.frameId ?? e.frame ?? e.f ?? i);
+      if(!Number.isFinite(fidRaw)) continue;
+      // apply downsampling in terms of input index (better memory if JSON indexes are continuous)
+      if((fidRaw % down) !== 0) continue;
+
+      let persons = e.persons ?? e.keypoints ?? e.kpts ?? e.people ?? e.poses;
+      if(!persons) continue;
+
+      // normalize many common formats into array-of-persons where each person is [[x,y,score?], ...]
+      if(Array.isArray(persons) && persons.length && typeof persons[0] === 'number'){
+        persons = [ this._flattenToKpts(persons) ];
+      } else if(Array.isArray(persons) && persons.length && Array.isArray(persons[0]) && typeof persons[0][0] === 'number'){
+        persons = persons.map(p => Array.isArray(p[0]) ? this._ensureKpts(p) : this._flattenToKpts(p));
+      } else if(Array.isArray(persons) && typeof persons[0] === 'object'){
+        persons = persons.map(p => this._ensureKpts(p.keypoints ?? p.kpts ?? p));
+      } else {
+        try{ persons = persons.map(p=>this._ensureKpts(p)); }catch(e){ continue; }
+      }
+
+      // For each person, precompute centroid and which edges are actually valid (both endpoints present)
+      const personsProcessed = persons.map(kpts => {
+        const centroid = avgPoint(kpts) || null;
+        const validEdges = [];
+        if(this.opts.precomputeEdges){
+          for(let ei=0; ei<EDGES.length; ei++){
+            const [aIdx,bIdx] = EDGES[ei];
+            const a = kpts[aIdx], b = kpts[bIdx];
+            if(a && b) validEdges.push([aIdx,bIdx]);
+          }
+        }
+        return { kpts, centroid, validEdges };
+      });
+
+      const fid = Math.floor(fidRaw / down); // normalized frame index after downsampling
+      this.poseMap.set(fid, personsProcessed);
+      if(fid > this.lastFrame) this.lastFrame = fid;
+      loadedFrames++;
+    }
+
+    // final note: user's fid reference mapping changed if downsample>1.
+    // lastFrame already set to max loaded fid.
+  }
+
+  _flattenToKpts(flat){
+    const k = [];
+    for(let i=0;i<flat.length;){
+      const x = Number(flat[i++]); if(isNaN(x)){ k.push(null); continue; }
+      const y = Number(flat[i++]); if(isNaN(y)){ k.push(null); continue; }
+      const maybe = flat[i];
+      if(maybe!==undefined && typeof maybe === 'number' && maybe<=1.0){ k.push([x,y,maybe]); i++; }
+      else k.push([x,y,1.0]);
+    }
+    return k;
+  }
+
+  _ensureKpts(p){
+    if(!p) return [];
+    if(Array.isArray(p) && typeof p[0] === 'number'){
+      if(p.length % 3 === 0){ const out=[]; for(let i=0;i<p.length;i+=3) out.push([p[i],p[i+1],p[i+2]]); return out; }
+      if(p.length % 2 === 0){ const out=[]; for(let i=0;i<p.length;i+=2) out.push([p[i],p[i+1],1.0]); return out; }
+    }
+    if(Array.isArray(p) && Array.isArray(p[0])) return p.map(q=> q? [q[0],q[1], q[2] ?? 1.0] : null);
+    return [];
+  }
+
+  // remove near-duplicate persons in same frame (keeps precomputed centroid/edges)
+  dedupeFrames(thresholdPx=8){
+    const t2 = thresholdPx*thresholdPx;
+    for(const [f, persons] of this.poseMap){
+      if(!persons || persons.length<2) continue;
+      const keep = [];
+      for(let i=0;i<persons.length;i++){
+        const c1 = persons[i].centroid;
+        if(!c1){ keep.push(persons[i]); continue; }
+        let duplicate=false;
+        for(const k of keep){
+          const c2 = k.centroid; if(!c2) continue;
+          if(dist2(c1, c2) <= t2){ duplicate=true; break; }
+        }
+        if(!duplicate) keep.push(persons[i]);
+      }
+      this.poseMap.set(f, keep);
+    }
+  }
+}
+
+// ------------------------- Lightweight UI primitives (unchanged) -------------------------
+class UIElement { constructor(x,y,w,h){ this.x=x; this.y=y; this.w=w; this.h=h; this.ui=null; } contains(px,py){ return px>=this.x && px<=this.x+this.w && py>=this.y && py<=this.y+this.h; } draw(){} mousePressed(){} mouseDragged(){} mouseReleased(){} }
+class UIButton extends UIElement{ constructor(x,y,w,label,onClick){ super(x,y,w,28); this.label=label; this.onClick=onClick; this.down=false; } draw(){ const hover=this.contains(mouseX,mouseY); push(); noStroke(); fill(this.down?30:(hover?50:35)); rect(this.x,this.y,this.w,this.h,8); stroke(255,140); noFill(); rect(this.x,this.y,this.w,this.h,8); noStroke(); fill(255); textAlign(CENTER,CENTER); textSize(13); text(this.label,this.x+this.w/2,this.y+this.h/2); pop(); } mousePressed(){ this.down=true; } mouseReleased(){ if(this.down && this.contains(mouseX,mouseY) && this.onClick) this.onClick(); this.down=false; } }
+class UILabel extends UIElement{ constructor(x,y,text){ super(x,y,200,24); this.text=text; } draw(){ push(); noStroke(); fill(220); textSize(14); textAlign(LEFT,CENTER); text(this.text,this.x,this.y+12); pop(); } }
+class UISlider extends UIElement{ constructor(x,y,w,min,max,value,step,onChange){ super(x,y,w,24); this.min=min; this.max=max; this.value=value; this.step=step||0.01; this.onChange=onChange; this.grab=false; } _valToX(v){ return this.x+(this.w-1)*((v-this.min)/(this.max-this.min)); } _xToVal(px){ const t=constrain((px-this.x)/(this.w-1),0,1); const v=this.min+t*(this.max-this.min); return (this.step>0)? Math.round(v/this.step)*this.step : v; } draw(){ push(); stroke(120); strokeWeight(2); line(this.x,this.y+this.h/2,this.x+this.w,this.y+this.h/2); const kx=this._valToX(this.value); noStroke(); fill(230); circle(kx,this.y+this.h/2,12); noStroke(); fill(220); textAlign(LEFT,CENTER); textSize(12); text(this.value.toFixed((this.step>=1)?0:(this.step>=0.1?1:2)), this.x+this.w+8, this.y+this.h/2); pop(); } mousePressed(){ this.grab=true; this.value=this._xToVal(mouseX); if(this.onChange) this.onChange(this.value); } mouseDragged(){ if(!this.grab) return; this.value=this._xToVal(mouseX); if(this.onChange) this.onChange(this.value); } mouseReleased(){ this.grab=false; } }
+class UIStepper extends UIElement{ constructor(x,y,w,value,step,min,max,onChange){ super(x,y,w,28); this.value=value; this.step=step||0.1; this.min=min||-Infinity; this.max=max||Infinity; this.onChange=onChange; this.btnW=28; this._dec=new UIButton(x,y,this.btnW,'–',()=>this._bump(-1)); this._inc=new UIButton(x+w-this.btnW,y,this.btnW,'+',()=>this._bump(+1)); } _bump(dir){ let v=this.value+dir*this.step; v=constrain(v,this.min,this.max); this.value=v; if(this.onChange) this.onChange(this.value); } draw(){ push(); noFill(); stroke(180,140); rect(this.x,this.y,this.w,this.h,6); noStroke(); fill(240); textAlign(CENTER,CENTER); textSize(13); text(this.value.toFixed(2), this.x+this.w/2, this.y+this.h/2); pop(); this._dec.draw(); this._inc.draw(); } mousePressed(){ if(this._dec.contains(mouseX,mouseY)) this._dec.mousePressed(); else if(this._inc.contains(mouseX,mouseY)) this._inc.mousePressed(); } mouseReleased(){ if(this._dec.down) this._dec.mouseReleased(); if(this._inc.down) this._inc.mouseReleased(); } }
+class UICheckbox extends UIElement{ constructor(x,y,label,initial,onToggle){ super(x,y,18,18); this.label=label; this.checked=initial||false; this.onToggle=onToggle; } draw(){ push(); stroke(140); rect(this.x,this.y,this.w,this.h,4); if(this.checked){ push(); translate(this.x+this.w/2,this.y+this.h/2); rotate(-PI/6); strokeWeight(3); line(-6,0,0,6); line(0,6,10,-8); pop(); } noStroke(); fill(220); textSize(13); textAlign(LEFT,CENTER); text(this.label,this.x+this.w+8,this.y+this.h/2); pop(); } mousePressed(){ this.checked = !this.checked; if(this.onToggle) this.onToggle(this.checked); } }
+class UITextBox extends UIElement{ constructor(x,y,w,initial,onChange){ super(x,y,w,28); this.value = initial || ''; this.onChange = onChange; } draw(){ push(); noFill(); stroke(160); rect(this.x,this.y,this.w,this.h,6); noStroke(); fill(240); textAlign(LEFT,CENTER); textSize(13); const disp = (this.value||'').length>120 ? (this.value||'').slice(0,117)+'...' : (this.value||''); text(disp, this.x+8, this.y+this.h/2); pop(); } mousePressed(){ const v = prompt('Pose text (editable). To copy full text use Copy button.', this.value); if(v !== null){ this.value = v; if(this.onChange) this.onChange(v); } } }
+
+// ------------------------- App (perf-minded) -------------------------
+class App {
+  constructor({videoFile, poseJSONFile, headFile, poseLoaderOpts} = {}){
+    this.videoFile = videoFile; this.poseJSONFile = poseJSONFile; this.headFile = headFile;
+
+    this.video = null; this.headImg = null;
+    this.poseLoader = new PoseLoader(this.poseJSONFile, poseLoaderOpts);
+
+    this.t = 0; this.playing=false; this.rate=1;
+
+    this.scaleCycle=[1,0.75,0.5,0.25]; this.scaleIdx=0; this.scale=this.scaleCycle[0];
+    this.pointSizes=[6,12,18,24,36]; this.ptIdx=1; this.ptSize=this.pointSizes[this.ptIdx];
+
+    this.headSize = 150; this.alpha = 200; this.offset={x:0,y:0}; this.drag={on:false,dx:0,dy:0};
+
+    this.trails = {}; this.showTrails = true; this.maxTrail = 240; this.trailAlpha = 160; this.trailWeight = 3; this.trailColors = [[0,200,255],[255,80,0],[0,255,120],[255,200,0],[180,120,255],[255,0,180]]; this.trailSkip=1;
+
+    this._vw=0; this._vh=0; this._scaleX=1; this._scaleY=1;
+
+    // set these OFF by default for speed; toggle in UI if needed
+    this.showFullPoseOnCanvas = false;
+    this.showLabelsOnCanvas = false;
+
+    // Parade (left-to-right static copies)
+    this.showParade = false;
+    this.paradeCount = 6;
+    this.paradeSpacing = 180;
+    this.paradeCopyScale = 0.5;
+
+    this.wristBlink = { enabled: true, rateHz: 2.0, minAlpha: 0.05, maxAlpha: 1.0 };
+
+    this.ui = new UIManager(this);
+    this.inited=false;
+  }
+
+  preload(){
+    this.poseLoader.preload(()=>{ /* no-op */ });
+    // head image lazy: don't error out if missing
+    this.headImg = loadImage(this.headFile, ()=>{}, ()=>{ this.headImg=null; });
+  }
+
+  setup(){
+    if(this.videoFile){
+      this.video = createVideo([this.videoFile], ()=>{
+        this.video.hide();
+        try{ this.video.elt.muted = true; this.video.elt.playsInline = true; }catch(e){}
+        this.video.speed(this.rate);
+      }, (err)=>{ console.warn('Video load failed',err); });
+    }
+    this.ui.build();
+  }
+
+  _userInit(){ this.inited=true; if(this.video){ try{ this.video.loop(); this.video.speed(this.rate); }catch(e){} } this.play(); }
+
+  tick(){
+    if(!this.poseLoader.ready){
+      push(); fill(255); textAlign(CENTER,CENTER); textSize(18); text('Waiting for pose JSON…', width/2, height/2 - 60); pop();
+      this.ui.draw(); return;
+    }
+
+    // advance logical time
+    if(this.playing){
+      const dt = (deltaTime/1000) * this.rate;
+      this.t += dt;
+      const poseDur = (this.poseLoader.lastFrame + 1) / FPS;
+      const vdur = (this.video && isFinite(this.video?.elt?.duration)) ? this.video.elt.duration : Infinity;
+      const maxDur = Math.min(poseDur, vdur);
+      if(this.t >= maxDur){ this.t = 0; if(this.video && this.videoReady()) try{ this.video.time(this.t); }catch(e){} }
+      if(this.video && this.videoReady()){ if(Math.abs(this.video.time() - this.t) > 0.06) this.video.time(this.t); try{ this.video.speed(this.rate); }catch(e){} }
+    }
+
+    const aspect = POSE_W/POSE_H;
+    this._vh = height;
+    this._vw = this._vh * aspect;
+    this._scaleX = this._vw / POSE_W;
+    this._scaleY = this._vh / POSE_H;
+
+    // draw video or background
+    if(this.video && this.inited && this.videoReady()){
+      image(this.video, 0, 0, this._vw, this._vh);
+    } else {
+      push(); noStroke(); fill(30); rect(0,0,this._vw,this._vh); fill(170); textAlign(CENTER,CENTER); textSize(16);
+      text(this.video ? 'Click \"Start / Init\" to play video' : 'No video — pose playback is active', this._vw/2, this._vh/2); pop();
+    }
+
+    // parade (static copies) under the dynamic overlay
+    if(this.showParade) this._drawParade();
+
+    if(this.showTrails) this._drawTrails();
+    this._drawPose();
+    this.ui.draw();
+  }
+
+  // faster parade: uses precomputed centroid & valid edges
+  _drawParade(){
+    const frameIndex = Math.floor(this.t * FPS);
+    const persons = this.poseLoader.poseMap.get(frameIndex) || [];
+    if(!persons || persons.length===0) return;
+
+    const srcIdx = Math.max(0, Math.floor((persons.length - 1) / 2));
+    const src = persons[srcIdx]; if(!src) return;
+    const cent = src.centroid || [POSE_W/2, POSE_H/2];
+    const baselineY = Math.round(this._vh * 0.78);
+
+    push();
+    const copyScale = this.paradeCopyScale * (this._scaleX + this._scaleY) * 0.5;
+    const totalWidth = (this.paradeCount - 1) * this.paradeSpacing;
+    const startX = Math.round((this._vw - totalWidth) / 2);
+
+    // draw copies left-to-right; each copy reuses src.kpts and src.validEdges
+    for(let i=0;i<this.paradeCount;i++){
+      const tx = startX + i * this.paradeSpacing;
+      // draw edges from precomputed validEdges (faster than checking endpoints each frame)
+      stroke(255,255,0, this.alpha); strokeWeight(Math.max(2,3*copyScale)); noFill();
+      if(src.validEdges && src.validEdges.length){
+        for(const [ai,bi] of src.validEdges){
+          const a = src.kpts[ai], b = src.kpts[bi];
+          const ax = tx + (a[0]-cent[0]) * copyScale;
+          const ay = baselineY + (a[1]-cent[1]) * copyScale;
+          const bx = tx + (b[0]-cent[0]) * copyScale;
+          const by = baselineY + (b[1]-cent[1]) * copyScale;
+          line(ax,ay,bx,by);
+        }
+      } else {
+        // fallback: attempt full EDGES loop (only happens when precompute disabled)
+        for(const e of EDGES){
+          const a = src.kpts[e[0]], b = src.kpts[e[1]]; if(!a||!b) continue;
+          const ax = tx + (a[0]-cent[0]) * copyScale;
+          const ay = baselineY + (a[1]-cent[1]) * copyScale;
+          const bx = tx + (b[0]-cent[0]) * copyScale;
+          const by = baselineY + (b[1]-cent[1]) * copyScale;
+          line(ax,ay,bx,by);
+        }
+      }
+
+      // draw keypoints (simple small circles)
+      noStroke(); fill(255,255,255, this.alpha);
+      const pr = Math.max(3, this.ptSize * copyScale);
+      for(let ki=0; ki<src.kpts.length; ki++){
+        const p = src.kpts[ki]; if(!p) continue;
+        const px = tx + (p[0]-cent[0]) * copyScale;
+        const py = baselineY + (p[1]-cent[1]) * copyScale;
+        ellipse(px, py, pr);
+      }
+    }
+
+    pop();
+  }
+
+  _drawPose(){
+    const frameIndex = Math.floor(this.t * FPS);
+    const persons = this.poseLoader.poseMap.get(frameIndex) || [];
+
+    push(); translate(this.offset.x, this.offset.y); scale(this.scale);
+
+    // draw bones using precomputed validEdges when available
+    stroke(255,255,0,this.alpha); strokeWeight(Math.max(3,4/this.scale)); noFill();
+    for(let p=0;p<persons.length;p++){
+      const person = persons[p];
+      if(!person) continue;
+      // try precomputed validEdges first
+      if(person.validEdges && person.validEdges.length){
+        for(const [ai,bi] of person.validEdges){
+          const a = person.kpts[ai], b = person.kpts[bi]; if(!a||!b) continue;
+          line(a[0]*this._scaleX, a[1]*this._scaleY, b[0]*this._scaleX, b[1]*this._scaleY);
+        }
+      } else {
+        // fallback
+        for(const e of EDGES){
+          const a = person.kpts[e[0]], b = person.kpts[e[1]]; if(!a||!b) continue;
+          line(a[0]*this._scaleX, a[1]*this._scaleY, b[0]*this._scaleX, b[1]*this._scaleY);
+        }
+      }
+    }
+
+    // cheaper per-frame computations: precompute blink outside inner loops
+    const blinkRate = Math.max(0.01, this.wristBlink.rateHz);
+    const blinkSin = Math.sin(TWO_PI * blinkRate * (millis()/1000));
+    const blinkNorm = (blinkSin + 1) * 0.5;
+    const blinkAlphaMultiplier = (this.wristBlink.minAlpha) + (this.wristBlink.maxAlpha - this.wristBlink.minAlpha) * blinkNorm;
+    const blinkOn = this.wristBlink.enabled;
+
+    noStroke(); fill(255,255,255,this.alpha); textAlign(CENTER,CENTER);
+    const roseSize = 20; // small; parade copies are the main visual now
+    const yOff = this.ptSize * 0.6;
+    const lblSize = Math.max(10, 14/this.scale);
+
+    // draw points, optional labels & emoji (emoji kept small; can disable in UI)
+    for(let p=0;p<persons.length;p++){
+      const person = persons[p];
+      if(!person) continue;
+      const k = person.kpts;
+
+      for(let i=0;i<k.length;i++){
+        const pt = k[i];
+        if(!pt) continue;
+        const x = pt[0]*this._scaleX, y = pt[1]*this._scaleY;
+        ellipse(x,y,this.ptSize);
+
+        // labels off by default to speed up; toggle app.showLabelsOnCanvas if you need them
+        if(this.ui.showLabels || this.showLabelsOnCanvas){
+          fill(255,255,255, Math.max(90, this.alpha - 30)); textSize(lblSize); text(i.toString(), x, y - this.ptSize); fill(255,0,0,this.alpha);
+        }
+
+        // wrists - optional blink emoji (keeps old feature)
+        if((i === 9) || (i === 10)){
+          const isRight = (i===10);
+          let emojiAlpha = this.alpha;
+          if(isRight && blinkOn) emojiAlpha = Math.round(this.alpha * blinkAlphaMultiplier);
+          push();
+          textSize(roseSize);
+          fill(255,255,255,emojiAlpha);
+          // only draw small emoji for cardinal person (middle)
+          const midPersonIndex = Math.floor((persons.length - 1) / 2);
+          if(isRight && p===midPersonIndex) text('🌺', x, y - yOff);
+          else if(!isRight) text('🌹', x, y - yOff);
+          pop();
+        }
+      }
+
+      // pose array text is off by default (heavy). show only when user opens Pose box.
+      if((this.showFullPoseOnCanvas || this.ui.jsonOpen) && person.centroid){
+        const arrLimit = this.showFullPoseOnCanvas ? (k.length || 0) : 8;
+        const arrStr = formatKptsArray(k, arrLimit, this.showFullPoseOnCanvas);
+        push(); textAlign(LEFT, CENTER); textSize(12); fill(220); const tx = person.centroid[0]*this._scaleX + 12; const ty = person.centroid[1]*this._scaleY; text(clampStr(arrStr, 320), tx, ty); pop();
+      }
+    }
+    pop();
+
+    this._updateTrails(frameIndex, persons);
+  }
+
+  _updateTrails(frameIndex, persons){
+    if((frameIndex % this.trailSkip) !== 0) return;
+    for(let pi=0; pi<persons.length; pi++){
+      if(!this.trails[pi]) this.trails[pi] = {};
+      const kpts = persons[pi]?.kpts || [];
+      for(let ki=0; ki<kpts.length; ki++){
+        const p = kpts[ki];
+        if(!p) continue;
+        const arr = (this.trails[pi][ki] ||= []);
+        arr.push({x:p[0], y:p[1]});
+        if(arr.length > this.maxTrail) arr.shift();
+      }
+    }
+  }
+
+  _drawTrails(){
+    push(); translate(this.offset.x, this.offset.y); scale(this.scale);
+    const baseW = Math.max(1.25, this.trailWeight / this.scale);
+    for(const piStr in this.trails){
+      const pi = Number(piStr);
+      const [r,g,b] = this.trailColors[pi % this.trailColors.length];
+      const parts = this.trails[pi];
+      for(const kiStr in parts){
+        const pts = parts[kiStr];
+        if(!pts || pts.length < 2) continue;
+        strokeWeight(baseW);
+        for(let s=1; s<pts.length; s++){
+          const a = lerp(40, this.trailAlpha, s/pts.length);
+          stroke(r,g,b,a);
+          const p1 = pts[s-1], p2 = pts[s];
+          line(p1.x * this._scaleX, p1.y * this._scaleY, p2.x * this._scaleX, p2.y * this._scaleY);
+        }
+      }
+    }
+    pop();
+  }
+
+  // transport
+  play(){ this.playing = true; if(this.video && this.videoReady()) try{ this.video.play(); this.video.speed(this.rate); }catch(e){} }
+  pause(){ this.playing = false; if(this.video) try{ this.video.pause(); }catch(e){} }
+  stop(){ this.playing=false; this.t=0; if(this.video) try{ this.video.pause(); this.video.time(0); }catch(e){} }
+  videoReady(){ return this.video && this.video.elt && this.video.elt.readyState >= 2; }
+
+  onKey(k){ if(k==='T') this.showTrails = !this.showTrails; if(k==='P') (this.playing? this.pause() : this.play()); if(k==='L') this.ui.showLabels = !this.ui.showLabels; if(k==='C') this.trails = {}; if(k==='J') this.ui.toggleJSON(); if(k==='[') this.ui.scrollJSON(-3); if(k===']') this.ui.scrollJSON(+3); }
+  onMousePressed(){ if(this.ui.mousePressed()) return; this.drag.on = true; this.drag.dx = mouseX - this.offset.x; this.drag.dy = mouseY - this.offset.y; }
+  onMouseDragged(){ if(!this.drag.on) return; this.offset.x = mouseX - this.drag.dx; this.offset.y = mouseY - this.drag.dy; }
+  onMouseReleased(){ if(this.ui.mouseReleased()) return; this.drag.on = false; }
+
+  saveWindowJSON(startSec=0, durationSec=2){
+    if(!this.poseLoader.ready) return;
+    startSec = Math.max(0, Number(startSec)||0);
+    durationSec = Math.max(0, Number(durationSec)||0);
+    const vd = (this.video && isFinite(this.video.elt.duration))? this.video.elt.duration : Infinity;
+    const startF = Math.max(0, Math.floor(startSec * FPS));
+    const endFExcl = Math.min(Math.floor((startSec+durationSec)*FPS), Math.floor((isFinite(vd)?vd:Infinity)*FPS)+1);
+    const hardEnd = Math.min(endFExcl, this.poseLoader.lastFrame + 1);
+    const out = [];
+    for(let f=startF; f<hardEnd; f++){
+      const rel = f - startF;
+      const persons = this.poseLoader.poseMap.get(f) || [];
+      const personsCopy = persons.map(p => p.kpts.map(q => (q ? [q[0], q[1], q[2] ?? 1] : null)));
+      out.push({ frame_id: rel, time_sec: +(rel / FPS).toFixed(3), persons: personsCopy });
+    }
+    saveJSON(out, `pose_segment_rel_${startSec.toFixed(2)}-${(startSec+durationSec).toFixed(2)}s.json`);
+  }
+
+  getPoseArrayString(frameIndex=null, personIndex=null, gapLines=1){
+    if(!this.poseLoader.ready) return 'Pose JSON not loaded';
+    frameIndex = (frameIndex===null) ? Math.floor(this.t*FPS) : frameIndex;
+    frameIndex = constrain(frameIndex, 0, this.poseLoader.lastFrame);
+    const persons = this.poseLoader.poseMap.get(frameIndex);
+    if(!persons || persons.length===0) return `frame ${frameIndex}: no persons`;
+    const lines = [];
+    for(let pi=0; pi<persons.length; pi++){
+      if(personIndex!==null && pi !== personIndex) continue;
+      const k = persons[pi].kpts;
+      lines.push(`Person[${pi}] — keypoints: ${k.length}`);
+      for(let ki=0; ki<k.length; ki++){
+        const p = k[ki];
+        if(!p) lines.push(`  [${ki}]: null`);
+        else { const x = (typeof p[0] === 'number') ? +p[0].toFixed(2) : p[0]; const y = (typeof p[1] === 'number') ? +p[1].toFixed(2) : p[1]; const s = (p.length>=3 && p[2]!=null) ? +p[2].toFixed(3) : 1.0; lines.push(`  [${ki}]: [${x}, ${y}, ${s}]`); }
+      }
+      for(let g=0; g<gapLines; g++) lines.push('');
+    }
+    return `frame: ${frameIndex}\n` + lines.join('\n');
+  }
+}
+
+// ------------------------- UIManager (unchanged layout; you can toggle features) -------------------------
+class UIManager{
+  constructor(app){ this.app = app; this.items = []; this._active = null; this.jsonOpen = false; this.showLabels = app.showLabelsOnCanvas; this.jsonScroll = 0; }
+
+  build(){
+    const y = height - 130; const row = (i)=> y + i*36; const right = width - 12;
+    this.add(new UIButton(12, row(0), 64, 'Play', ()=>this.app.play()));
+    this.add(new UIButton(80, row(0), 64, 'Pause', ()=>this.app.pause()));
+    this.add(new UIButton(148, row(0), 64, 'Stop', ()=>this.app.stop()));
+    this.add(new UIButton(216, row(0), 72, 'Scale', ()=>{ this.app.scaleIdx = (this.app.scaleIdx + 1) % this.app.scaleCycle.length; this.app.scale = this.app.scaleCycle[this.app.scaleIdx]; this.app.ptIdx = (this.app.ptIdx + 1) % this.app.pointSizes.length; this.app.ptSize = this.app.pointSizes[this.app.ptIdx]; }));
+    this.add(new UIButton(294, row(0), 120, 'Toggle Trails', ()=> this.app.showTrails = !this.app.showTrails));
+    this.add(new UIButton(418, row(0), 110, 'Clear Trails', ()=> { this.app.trails = {}; }));
+    this.add(new UIButton(532, row(0), 100, 'Labels (L)', ()=> { this.app.ui.showLabels = !this.app.ui.showLabels; this.app.showLabelsOnCanvas = !this.app.showLabelsOnCanvas; }));
+    this.add(new UIButton(right - 78, row(0), 66, 'JSON', ()=>{ this.toggleJSON(); }));
+
+    // sliders
+    this.add(new UILabel(12, row(1), 'Speed')); this.add(new UISlider(70, row(1), 200, 0.25, 2.0, this.app.rate, 0.01, (v)=>{ this.app.rate=v; if(this.app.video) try{ this.app.video.speed(v);}catch(e){} }));
+    this.add(new UILabel(280, row(1), 'Alpha')); this.add(new UISlider(336, row(1), 200, 0, 255, this.app.alpha, 1, (v)=>{ this.app.alpha=v|0; }));
+    this.add(new UILabel(548, row(1), 'Trail Len')); this.add(new UISlider(620, row(1), 220, 10, 600, this.app.maxTrail, 1, (v)=>{ this.app.maxTrail=v|0; }));
+    this.add(new UILabel(848, row(1), 'Thick')); this.add(new UISlider(898, row(1), 150, 1, 8, this.app.trailWeight, 0.5, (v)=>{ this.app.trailWeight=v; }));
+
+    // steppers + export
+    this.add(new UILabel(12, row(2), 'Start(s)')); this.add(new UIStepper(76, row(2), 120, 0.00, 0.05, 0, 9999, (v)=>{}));
+    this.add(new UILabel(206, row(2), 'Dur(s)')); this.add(new UIStepper(256, row(2), 120, 2.00, 0.05, 0, 9999, (v)=>{}));
+    this.add(new UIButton(386, row(2), 110, '↘ Start=Now', ()=>{ }));
+    this.add(new UIButton(right-420, row(2), 120, 'Save 0–2s', ()=> this.app.saveWindowJSON(0,2)));
+    this.add(new UIButton(right-294, row(2), 120, 'Save 0–5s', ()=> this.app.saveWindowJSON(0,5)));
+    this.add(new UIButton(right-168, row(2), 156, 'Save Range', ()=> this.app.saveWindowJSON(0,2)));
+
+    // extras
+    this.add(new UILabel(12, row(3), 'Frame Gap')); this.add(new UITextBox(80, row(3), 120, '1', (v)=>{ const n = Math.max(1, Math.floor(Number(v) || 1)); this.app.trailSkip = n; }));
+    this.add(new UILabel(220, row(3), 'Dedupe(px)')); this.add(new UITextBox(300, row(3), 120, '8', (v)=>{ const n = Math.max(0, Number(v) || 0); this.app.poseLoader.dedupeFrames(n); }));
+    this.add(new UICheckbox(440, row(3)+4, 'Full Pose', this.app.showFullPoseOnCanvas, (checked)=>{ this.app.showFullPoseOnCanvas = checked; }));
+
+    // wrist blink
+    this.add(new UICheckbox(540, row(3)+4, 'Blink Wrist 10', this.app.wristBlink.enabled, (checked)=>{ this.app.wristBlink.enabled = checked; }));
+    this.add(new UILabel(680, row(3), 'Blink Hz')); this.add(new UISlider(740, row(3), 180, 0.1, 6.0, this.app.wristBlink.rateHz, 0.1, (v)=>{ this.app.wristBlink.rateHz = v; }));
+
+    this.initBtn = new UIButton(width/2 - 100, height/2 - 32, 200, 'Start / Init', ()=> this.app._userInit()); this.add(this.initBtn);
+
+    this.poseBox = new UITextBox(440, row(2)-36, 520, ''); this.add(this.poseBox);
+    this.add(new UIButton(972, row(2)-36, 88, 'Show Pose', ()=> { const s = this.app.getPoseArrayString( Math.floor(this.app.t*FPS), null, 1 ); this.poseBox.value = s; }));
+    this.add(new UIButton(1064, row(2)-36, 64, 'Copy', ()=> { const txt = this.poseBox.value || ''; if(navigator && navigator.clipboard && navigator.clipboard.writeText){ navigator.clipboard.writeText(txt).catch(()=>{ alert('Copy failed; opening prompt. Use Ctrl+C to copy.'); prompt('Copy pose text:', txt); }); } else { prompt('Copy pose text:', txt); } }));
+
+    // Parade controls
+    this.add(new UICheckbox(972, row(0)+6, 'Parade', false, (checked)=>{ this.app.showParade = checked; }));
+    this.add(new UILabel(1040, row(0)+6, 'Count'));
+    this.add(new UIStepper(1090, row(0)+6, 100, this.app.paradeCount, 1, 1, 99, (v)=>{ this.app.paradeCount = Math.max(1, Math.round(v)); }));
+    this.add(new UILabel(972, row(1)+6, 'Gap')); this.add(new UISlider(1010, row(1)+6, 180, 60, 360, this.app.paradeSpacing, 10, (v)=>{ this.app.paradeSpacing = Math.round(v); }));
+    this.add(new UILabel(1196, row(1)+6, 'Copy Scale')); this.add(new UISlider(1280-12-160, row(1)+6, 160, 0.2, 1.0, this.app.paradeCopyScale, 0.05, (v)=>{ this.app.paradeCopyScale = v; }));
+  }
+
+  add(w){ this.items.push(w); w.ui=this; return w; }
+  draw(){ for(const w of this.items) w.draw(); if(this.jsonOpen) this._drawJSONPanel(); }
+
+  mousePressed(){ for(let i=this.items.length-1;i>=0;i--){ const w=this.items[i]; if(w.mousePressed && w.contains(mouseX,mouseY)){ this._active=w; w.mousePressed(); return true; } } return false; }
+  mouseDragged(){ if(this._active && this._active.mouseDragged) this._active.mouseDragged(); }
+  mouseReleased(){ if(this._active && this._active.mouseReleased) this._active.mouseReleased(); this._active=null; return true; }
+
+  toggleJSON(){ this.jsonOpen = !this.jsonOpen; this.jsonScroll = 0; }
+  scrollJSON(delta){ this.jsonScroll = constrain(this.jsonScroll + delta, 0, 9999); }
+
+  _drawJSONPanel(){ /* same inspector as before; kept for debugging */ 
+    const w = 420; const h = height - 32; const x = width - w - 12; const y = 16; const pad=12; const headerH=28; const lineH=16; push(); noStroke(); fill(14,16,20,230); rect(x,y,w,h,8); fill(255); textAlign(LEFT,CENTER); textSize(14); const frameIndex = constrain(Math.floor(this.app.t * FPS), 0, this.app.poseLoader.lastFrame); const totalFrames = this.app.poseLoader.lastFrame > 0 ? (this.app.poseLoader.lastFrame+1) : 'n/a'; text(`JSON Inspector — frame ${frameIndex} / ${totalFrames}`, x + pad, y + headerH/2); textSize(11); fill(200); text('Toggle: J   Scroll: mouse wheel / [ ]', x + pad, y + headerH - 6);
+
+    if(!this.app.poseLoader.ready){ fill(180); textAlign(CENTER,CENTER); textSize(12); text('Pose JSON not loaded', x + w/2, y + h/2); pop(); return; }
+
+    const persons = this.app.poseLoader.poseMap.get(frameIndex) || [];
+    const rows = [];
+    rows.push(`frame: ${frameIndex}  persons: ${persons.length}`);
+    for(let pi=0; pi<persons.length; pi++){ const kpts = persons[pi].kpts; rows.push(` person[${pi}] keypoints: ${kpts.length}`); for(let ki=0; ki<kpts.length; ki++){ const p = kpts[ki]; if(!p) rows.push(`   [${ki}]: null`); else{ const xval = (typeof p[0] === 'number') ? p[0].toFixed(1) : String(p[0]); const yval = (typeof p[1] === 'number') ? p[1].toFixed(1) : String(p[1]); const score = (p.length>=3 && p[2]!=null) ? (typeof p[2]==='number' ? p[2].toFixed(2) : String(p[2])) : '1.00'; rows.push(`   [${ki}]: x=${xval}, y=${yval}, s=${score}`); } } }
+
+    const total = rows.length; const maxRows = 18; this.jsonScroll = constrain(this.jsonScroll, 0, Math.max(0, total - maxRows)); const start = this.jsonScroll; const end = Math.min(total, start + maxRows);
+    push(); translate(x + pad, y + headerH + 6); noStroke(); fill(255); textAlign(LEFT, TOP); textSize(12); let ty = 0; for(let r=start; r<end; r++){ const str = rows[r]; if(str.startsWith('frame:')) fill(180,255,180); else if(str.trim().startsWith('person[')) fill(180,220,255); else fill(210); text(str, 0, ty); ty += lineH; } pop();
+    push(); fill(40,80); noStroke(); const trackX = x + w - pad*1.5 - 6; const trackY = y + headerH + 6; rect(trackX, trackY, 6, h - headerH - 12, 3); const thumbH = Math.max(20, (maxRows / Math.max(1,total)) * (h - headerH - 12)); const thumbYRange = (h - headerH - 12) - thumbH; const thumbY = (total <= maxRows) ? 0 : (this.jsonScroll / (total - maxRows)) * thumbYRange; fill(200,140); rect(trackX, trackY + thumbY, 6, thumbH, 3); pop();
+    pop();
+  }
+}
